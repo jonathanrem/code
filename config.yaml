@@ -1,0 +1,66 @@
+common:
+  target_col: outcome
+  random_state: 2
+  n_folds: 5
+
+paths:
+  data_dir: data
+  source: data/dataframe_cleaned.csv
+  train: data/train_df.csv
+  test: data/test_df.csv
+  runs_dir: runs
+  model: runs\tuned_model\model.pkl
+  metadata: runs\tuned_model\metadata.json
+
+teams:
+  hook_url: "https://ecambxl.webhook.office.com/webhookb2/13965ae2-f69f-4466-8b32-eb5b9c867eed@e3d6f09e-9ba9-4a36-ad75-d9039be4fe29/IncomingWebhook/a92dbd0799e84fc9b7c73edba03da28e/9fef2881-7fae-4931-8a8f-bf908ff35c9d/V2AvEeZIW5MzIrvSQ0vtoEbGPb5flJhBkPDfJvrGwEXYE1"
+
+model_v2:
+  run_test: false
+  auto_evaluate: false
+  verbose: false
+  features_to_drop:
+    - Order
+
+  # features_to_drop:
+  # - Order
+  # - suspicious_trus
+  # - family_history
+  # - prev_neg_trus_biopsy
+  # - psa
+  # - nb_susp_lesions
+  # - diameter
+  # - contralateral_suspicious
+  # - contralateral_pirads
+  # - contralateral_diameter
+  # - epe
+  # - ant
+  # - mid
+  # - post
+  # - base
+  # - median
+  # - apical
+  
+  early_stopping_metric: logloss
+  early_stopping_rounds: 100
+  common_threshold: 0.2
+
+optuna:
+  n_trials: 2000
+  n_folds: 5
+  n_threads: -1
+  tree_method: hist
+  early_stopping_rounds: 50
+  study_name: prostate_xgb
+  storage: sqlite:///optuna.db
+
+evaluate:
+  use_test_df: true
+  common_threshold: 0.2
+  shap_sample_size: 200
+  shap_local_count: 3
+  apply_nan_handling: true
+  subgroup_min_size: 30
+
+split:
+  test_size: 0.10

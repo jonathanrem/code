@@ -1,0 +1,44 @@
+# ── Core ML ────────────────────────────────────────────────────────────────
+xgboost==3.2.0
+scikit-learn==1.8.0
+numpy==2.4.2
+pandas==3.0.0
+scipy==1.17.0
+joblib==1.5.3
+
+# ── Hyperparameter optimization ─────────────────────────────────────────────
+optuna==4.6.0
+optuna-dashboard==0.20.0
+SQLAlchemy==2.0.45
+alembic==1.17.2
+
+# ── Model explainability ────────────────────────────────────────────────────
+shap==0.50.0
+
+# ── Statistics ──────────────────────────────────────────────────────────────
+statsmodels==0.14.6
+localreg==0.5.0
+MLstatkit==0.1.91               # DeLong test
+
+# ── Visualization ───────────────────────────────────────────────────────────
+matplotlib==3.10.8
+seaborn==0.13.2
+
+# ── Data I/O ────────────────────────────────────────────────────────────────
+openpyxl==3.1.5
+PyYAML==6.0.3
+
+# ── Notifications ───────────────────────────────────────────────────────────
+pymsteams==0.2.5
+
+# ── Jupyter (évaluation interactive, test_kuleuven.ipynb) ───────────────────
+ipython==9.10.0
+ipykernel==7.2.0
+jupyter_client==8.8.0
+jupyter_core==5.9.1
+
+# ── Utils ───────────────────────────────────────────────────────────────────
+tqdm==4.67.1
+python-dateutil==2.9.0.post0
+tzdata==2025.3
+six==1.17.0
