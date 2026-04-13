@@ -1,0 +1,18 @@
+# Images
+*.png
+
+# Fichiers pickle
+*.pkl
+
+# Bases de données
+*.db
+*.csv
+
+# Fichiers texte
+*.txt
+*.json
+*.md
+
+# Dossiers
+__pycache__/
+runs/
