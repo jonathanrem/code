@@ -1,7 +1,6 @@
 # Dataset
 
-The dataset used in this project cannot be shared in this repository for patient confidentiality reasons. It is derived from a private multi-center clinical cohort and contains protected health information.
-
+The dataset used in this project cannot be shared in this repository for patient confidentiality reasons. It is derived from a private multi-center clinical cohort.
 ## Features
 
 | Feature | Description |
