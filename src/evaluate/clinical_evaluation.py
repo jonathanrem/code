@@ -33,7 +33,7 @@ import seaborn as sns
 from scipy.stats import rankdata
 from sklearn.calibration import calibration_curve
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score, roc_curve
+from sklearn.metrics import brier_score_loss, roc_auc_score, roc_curve
 from scipy.interpolate import interp1d
 from statsmodels.genmod.generalized_linear_model import GLM
 from statsmodels.genmod.families import Binomial
@@ -65,9 +65,7 @@ plt.rcParams.update({
 })
 
 
-# ---------------------------------------------------------------------------
 # 1. AUROC — single discrimination metric
-# ---------------------------------------------------------------------------
 def compute_auc(y_true: np.ndarray, y_proba: np.ndarray) -> float:
     """
     Clinical purpose: quantify the model's ability to rank patients with
@@ -77,9 +75,7 @@ def compute_auc(y_true: np.ndarray, y_proba: np.ndarray) -> float:
     return float(roc_auc_score(y_true, y_proba))
 
 
-# ---------------------------------------------------------------------------
 # 2. Calibration assessment
-# ---------------------------------------------------------------------------
 def compute_calibration_metrics(
     y_true: np.ndarray, y_proba: np.ndarray, n_groups: int = 10
 ) -> dict:
@@ -143,27 +139,68 @@ def plot_calibration(
     y_true: np.ndarray,
     y_proba: np.ndarray,
     n_groups: int = 10,
+    n_bootstrap: int = 200,
+    show_decile_points: bool = False,
     save_path: Path | None = None,
 ) -> None:
     """
     Clinical purpose: visualise agreement between predicted risk and
     observed proportion. The diagonal = perfect calibration. Deviations
     indicate over- or under-estimation of risk.
+
+    Displays a LOESS-smoothed calibration curve with 95% percentile
+    bootstrap CI band, as recommended by Van Calster et al. (2025,
+    Lancet Digital Health, Figure 3). Decile-grouped scatter available
+    as optional overlay via show_decile_points=True.
     """
     y = np.asarray(y_true, dtype=float)
     p = np.asarray(y_proba, dtype=float)
+    n = len(y)
 
     fig, ax = plt.subplots(figsize=(8, 6))
 
-    # Grouped calibration points
-    df = pd.DataFrame({"p": p, "y": y})
-    df["q"] = pd.qcut(df["p"], q=n_groups, duplicates="drop")
-    grouped = df.groupby("q", observed=True).agg(
-        mean_p=("p", "mean"), mean_y=("y", "mean")
-    )
-    ax.scatter(grouped["mean_p"], grouped["mean_y"],
-               color="black", s=40, marker="^", facecolors="none",
-               label="Grouped calibration")
+    # LOESS calibration curve on full data
+    sort_idx = np.argsort(p)
+    p_sorted = p[sort_idx]
+    flc_sorted = lowess(y[sort_idx], p_sorted, frac=0.75, return_sorted=False)
+    ax.plot(p_sorted, flc_sorted, color="black", lw=2, label="LOESS calibration")
+
+    # Bootstrap CI band (percentile method)
+    p_grid = np.linspace(float(p.min()), float(p.max()), 200)
+    rng = np.random.default_rng(RANDOM_SEED)
+    boot_curves = []
+    for _ in range(n_bootstrap):
+        idx = rng.choice(n, size=n, replace=True)
+        y_b, p_b = y[idx], p[idx]
+        if len(np.unique(y_b)) < 2:
+            continue
+        sort_b = np.argsort(p_b)
+        flc_b = lowess(y_b[sort_b], p_b[sort_b], frac=0.75, return_sorted=False)
+        interp_fn = interp1d(
+            p_b[sort_b], flc_b, kind="linear",
+            bounds_error=False, fill_value=(float(flc_b[0]), float(flc_b[-1])),
+        )
+        boot_curves.append(np.clip(interp_fn(p_grid), 0.0, 1.0))
+
+    if boot_curves:
+        arr = np.array(boot_curves)
+        ax.fill_between(
+            p_grid,
+            np.percentile(arr, 2.5, axis=0),
+            np.percentile(arr, 97.5, axis=0),
+            color="black", alpha=0.15, label="95% CI (bootstrap)",
+        )
+
+    # Optional decile scatter overlay
+    if show_decile_points:
+        df = pd.DataFrame({"p": p, "y": y})
+        df["q"] = pd.qcut(df["p"], q=n_groups, duplicates="drop")
+        grouped = df.groupby("q", observed=True).agg(
+            mean_p=("p", "mean"), mean_y=("y", "mean")
+        )
+        ax.scatter(grouped["mean_p"], grouped["mean_y"],
+                   color="black", s=40, marker="^", facecolors="none",
+                   label="Grouped calibration (deciles)")
 
     # Ideal diagonal
     ax.plot([0, 1], [0, 1], color="gray", linestyle="--", lw=1, label="Ideal")
@@ -178,12 +215,10 @@ def plot_calibration(
     if save_path:
         fig.savefig(save_path, dpi=150)
         print(f"Calibration plot saved to {save_path}")
-    plt.show()
+    plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
 # 3. Risk distribution
-# ---------------------------------------------------------------------------
 def plot_risk_distribution(
     y_true: np.ndarray,
     y_proba: np.ndarray,
@@ -217,12 +252,10 @@ def plot_risk_distribution(
     if save_path:
         fig.savefig(save_path, dpi=150)
         print(f"Risk distribution plot saved to {save_path}")
-    plt.show()
+    plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
 # 4. Decision Curve Analysis
-# ---------------------------------------------------------------------------
 def decision_curve_analysis(
     y_true: np.ndarray,
     y_proba: np.ndarray,
@@ -285,14 +318,234 @@ def decision_curve_analysis(
     if save_path:
         fig.savefig(save_path, dpi=150)
         print(f"Decision curve plot saved to {save_path}")
-    plt.show()
+    plt.close(fig)
 
     return {"thresholds": thresholds.tolist(), "net_benefit": nb_model.tolist()}
 
 
-# ---------------------------------------------------------------------------
+# 4b. Focused Decision Curve Analysis — publication quality
+_FOCUSED_MODEL_META: dict[str, tuple[str, str, str, float]] = {
+    # key: (display_name, color, linestyle, linewidth)
+    # ML models — solid lines
+    "with_contralateral":  ("With contralateral",  "tab:red",    "-",  1.8),
+    "parsimonious":        ("Parsimonious",         "tab:brown",  "-",  1.8),
+    "logistic_regression": ("Logistic regression",  "tab:green",  "-",  1.8),
+    # Nomograms — dashed lines
+    "peeters":             ("Peeters 2022",          "#7f7f7f",    "--", 1.4),
+    "kinnaird":            ("Kinnaird 2021",         "tab:orange", "--", 1.4),
+    "erspc":               ("ERSPC-RC",              "tab:purple", "--", 1.4),
+}
+
+
+def plot_dca_focused(
+    models: list[str] | None = None,
+    output_dir: Path | None = None,
+) -> None:
+    """Focused DCA for publication: Lancet 1-column (9 cm wide), 300 dpi, PNG + PDF.
+
+    Parameters
+    ----------
+    models:
+        Ordered list of model keys to include. Defaults to all entries in
+        _FOCUSED_MODEL_META. Valid keys: with_contralateral, parsimonious,
+        logistic_regression, peeters, kinnaird, erspc.
+    output_dir:
+        Destination folder for dca_focused.png / .pdf.
+        Defaults to <repo>/outputs/v2/figures/.
+        The net-benefit CSV is always written to <repo>/outputs/v2/.
+    """
+    _ROOT_DCA = Path(__file__).resolve().parent.parent.parent
+    _COMPARE_DIR = Path(__file__).resolve().parent.parent / "compare"
+    if str(_COMPARE_DIR) not in sys.path:
+        sys.path.insert(0, str(_COMPARE_DIR))
+
+    # Local imports to avoid circular dependency (compare_models → clinical_evaluation)
+    from models import (                            # noqa: PLC0415
+        get_probabilities_xgb_all_features,
+        get_probabilities_xgb_parsimonious,
+        get_probabilities_logreg_new,
+        get_probabilities_peter2022,
+        get_probabilities_kinnaird,
+        get_probabilities_erspc,
+    )
+    from common.data import load_compare_data       # noqa: PLC0415
+
+    _LOADER_MAP = {
+        "with_contralateral":  get_probabilities_xgb_all_features,
+        "parsimonious":        get_probabilities_xgb_parsimonious,
+        "logistic_regression": get_probabilities_logreg_new,
+        "peeters":             get_probabilities_peter2022,
+        "kinnaird":            get_probabilities_kinnaird,
+        "erspc":               get_probabilities_erspc,
+    }
+
+    if models is None:
+        models = list(_FOCUSED_MODEL_META.keys())
+
+    if output_dir is None:
+        output_dir = _ROOT_DCA / "outputs" / "v2" / "figures"
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Load data ────────────────────────────────────────────────────────────
+    X_test, y_test = load_compare_data()
+    df_test = X_test.copy()
+    df_test["outcome"] = y_test
+
+    proba_dict: dict[str, tuple[pd.Series, pd.Series]] = {}
+    for key in models:
+        if key not in _LOADER_MAP:
+            print(f"[WARN] Unknown model key '{key}' — skipped.")
+            continue
+        y_m, p_m = _LOADER_MAP[key](df_test)
+        proba_dict[key] = (y_m, p_m)
+
+    if not proba_dict:
+        raise ValueError("No valid models loaded for plot_dca_focused.")
+
+    # ── Common patient set (intersection of all model indices) ───────────────
+    common_idx = None
+    for y_m, _ in proba_dict.values():
+        common_idx = y_m.index if common_idx is None else common_idx.intersection(y_m.index)
+    common_idx = common_idx.sort_values()
+    N = len(common_idx)
+
+    ref_key = next(iter(proba_dict))
+    y_common = proba_dict[ref_key][0].loc[common_idx]
+    prevalence = float(y_common.mean())
+
+    # ── AUROC on the common set ───────────────────────────────────────────────
+    aurocs: dict[str, float] = {
+        key: float(roc_auc_score(y_m.loc[common_idx], p_m.loc[common_idx]))
+        for key, (y_m, p_m) in proba_dict.items()
+    }
+
+    # ── Net benefit curves ───────────────────────────────────────────────────
+    thresholds = np.arange(0.05, 0.401, 0.01)
+
+    def _nb(p_series: pd.Series, t: float) -> float:
+        p_c = p_series.loc[common_idx]
+        tp = float(((p_c >= t) & (y_common == 1)).sum())
+        fp = float(((p_c >= t) & (y_common == 0)).sum())
+        return tp / N - fp / N * (t / (1.0 - t))
+
+    nb_curves: dict[str, np.ndarray] = {
+        key: np.array([_nb(p_m, t) for t in thresholds])
+        for key, (_, p_m) in proba_dict.items()
+    }
+    nb_treat_all = np.array([
+        prevalence - (1.0 - prevalence) * (t / (1.0 - t)) for t in thresholds
+    ])
+
+    # ── Plot ──────────────────────────────────────────────────────────────────
+    fig_w_in = 9.0 / 2.54   # Lancet 1-column ≈ 8.9 cm
+    fig_h_in = 7.5 / 2.54
+
+    with plt.rc_context({
+        "font.size":          7,
+        "axes.titlesize":     7,
+        "axes.labelsize":     7,
+        "xtick.labelsize":    6,
+        "ytick.labelsize":    6,
+        "legend.fontsize":    6,
+        "font.family":        "sans-serif",
+        "axes.linewidth":     0.6,
+        "xtick.major.width":  0.5,
+        "ytick.major.width":  0.5,
+        "xtick.major.size":   2.5,
+        "ytick.major.size":   2.5,
+    }):
+        fig, ax = plt.subplots(figsize=(fig_w_in, fig_h_in))
+
+        for key in models:
+            if key not in nb_curves:
+                continue
+            label_name, color, ls, lw = _FOCUSED_MODEL_META[key]
+            nb_sm = lowess(nb_curves[key], thresholds, frac=0.15, return_sorted=False)
+            auc_str = f"{aurocs.get(key, float('nan')):.3f}"
+            ax.plot(thresholds, nb_sm, color=color, ls=ls, lw=lw,
+                    label=f"{label_name} ({auc_str})")
+
+        nb_ta_sm = lowess(nb_treat_all, thresholds, frac=0.15, return_sorted=False)
+        ax.plot(thresholds, nb_ta_sm, color="black", ls=":", lw=1.0, label="Treat all")
+        ax.axhline(0.0, color="black", ls=(0, (4, 2)), lw=0.8, label="Treat none")
+
+        y_upper = max(float(nb_treat_all[0]) * 1.08, 0.05)
+        ax.set_xlim(0.05, 0.40)
+        ax.set_ylim(-0.02, y_upper)
+        ax.set_xlabel("Decision threshold")
+        ax.set_ylabel("Net benefit")
+
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.tick_params(direction="out", pad=2)
+
+        ax.legend(
+            loc="upper right",
+            frameon=True,
+            framealpha=0.9,
+            edgecolor="none",
+            handlelength=1.6,
+            borderpad=0.4,
+            labelspacing=0.25,
+        )
+
+        fig.tight_layout(pad=0.4)
+
+        for ext in ("png", "pdf"):
+            out_path = output_dir / f"dca_focused.{ext}"
+            fig.savefig(out_path, dpi=300, bbox_inches="tight")
+            print(f"[OK] Saved {out_path}")
+
+        plt.close(fig)
+
+    # ── CSV: net benefit + clinical metrics at key thresholds ────────────────
+    report_thresholds = [0.10, 0.15, 0.20, 0.25]
+    rows: list[dict] = []
+
+    for key in models:
+        if key not in proba_dict:
+            continue
+        label_name = _FOCUSED_MODEL_META[key][0]
+        _, p_m = proba_dict[key]
+        p_c = p_m.loc[common_idx]
+        for t in report_thresholds:
+            tp = int(((p_c >= t) & (y_common == 1)).sum())
+            fp = int(((p_c >= t) & (y_common == 0)).sum())
+            fn = int(((p_c <  t) & (y_common == 1)).sum())
+            nb_val = tp / N - fp / N * (t / (1.0 - t))
+            rows.append({
+                "model":                    label_name,
+                "threshold":                t,
+                "net_benefit":              round(nb_val, 4),
+                "biopsies_avoided_per100":  round((N - tp - fp) / N * 100, 1),
+                "csPCa_missed_per100":      round(fn / N * 100, 2),
+            })
+
+    for t in report_thresholds:
+        nb_ta = prevalence - (1.0 - prevalence) * (t / (1.0 - t))
+        rows.append({
+            "model":                    "Treat all",
+            "threshold":                t,
+            "net_benefit":              round(nb_ta, 4),
+            "biopsies_avoided_per100":  0.0,
+            "csPCa_missed_per100":      0.0,
+        })
+        rows.append({
+            "model":                    "Treat none",
+            "threshold":                t,
+            "net_benefit":              0.0,
+            "biopsies_avoided_per100":  100.0,
+            "csPCa_missed_per100":      round(prevalence * 100, 2),
+        })
+
+    csv_path = _ROOT_DCA / "outputs" / "v2" / "dca_focused_netbenefit.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
+    print(f"[OK] Net benefit CSV → {csv_path}  (N={N}, prevalence={prevalence:.3f})")
+
+
 # 5. Expected Cost analysis
-# ---------------------------------------------------------------------------
 def expected_cost_analysis(
     y_true: np.ndarray,
     y_proba: np.ndarray,
@@ -354,7 +607,7 @@ def expected_cost_analysis(
     if save_path:
         fig.savefig(save_path, dpi=150)
         print(f"Expected cost plot saved to {save_path}")
-    plt.show()
+    plt.close(fig)
 
     return {
         "cost_grid": cost_grid.tolist(),
@@ -363,9 +616,7 @@ def expected_cost_analysis(
     }
 
 
-# ---------------------------------------------------------------------------
 # 6. Bootstrap confidence intervals
-# ---------------------------------------------------------------------------
 def bootstrap_evaluation(
     y_true: np.ndarray,
     y_proba: np.ndarray,
@@ -390,6 +641,7 @@ def bootstrap_evaluation(
         "AUROC",
         "O:E ratio", "Cal. intercept", "Cal. slope", "ECI", "ICI", "ECE",
         "Net benefit", "Standardized net benefit",
+        "Brier",
     ]
     boot_results = pd.DataFrame(np.nan, index=range(n_bootstrap), columns=col_names)
 
@@ -423,6 +675,7 @@ def bootstrap_evaluation(
         nb = tp / n - fp / n * (cut / (1 - cut))
         boot_results.iloc[i, 7] = nb
         boot_results.iloc[i, 8] = nb / np.mean(y_b)
+        boot_results.iloc[i, 9] = brier_score_loss(y_b, p_b)
 
     # Point estimates
     point_auroc = compute_auc(y, p)
@@ -432,11 +685,13 @@ def bootstrap_evaluation(
     point_nb = tp / n - fp / n * (cut / (1 - cut))
     point_snb = point_nb / np.mean(y)
 
+    point_brier = brier_score_loss(y, p)
     point_estimates = [
         point_auroc,
         point_cal["O:E ratio"], point_cal["Cal. intercept"], point_cal["Cal. slope"],
         point_cal["ECI"], point_cal["ICI"], point_cal["ECE"],
         point_nb, point_snb,
+        point_brier,
     ]
 
     # 95% CI (percentile method)
@@ -450,9 +705,7 @@ def bootstrap_evaluation(
     return summary
 
 
-# ---------------------------------------------------------------------------
 # 7. ROC curve with bootstrap 95% CI
-# ---------------------------------------------------------------------------
 def plot_roc_with_ci(
     y_true: np.ndarray,
     y_proba: np.ndarray,
@@ -511,14 +764,92 @@ def plot_roc_with_ci(
     if save_path:
         fig.savefig(save_path, dpi=150)
         print(f"ROC curve saved to {save_path}")
-    plt.show()
+    plt.close(fig)
 
     return {"auroc": auc_point, "lcl": auc_lcl, "ucl": auc_ucl}
 
 
-# ---------------------------------------------------------------------------
+# Multi-model evaluation (called from compare_models.py)
+def evaluate_model(
+    name: str,
+    y_true: np.ndarray,
+    y_proba: np.ndarray,
+    output_dir: Path,
+    n_bootstrap: int = 1000,
+    n_groups: int = 10,
+    cut: float = 0.2,
+) -> dict:
+    """Run full calibration + discrimination evaluation for one model."""
+    safe_name = name.replace(" ", "_").replace("(", "").replace(")", "")
+    model_dir = output_dir / safe_name
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    auroc = compute_auc(y_true, y_proba)
+    cal = compute_calibration_metrics(y_true, y_proba, n_groups=n_groups)
+    plot_calibration(y_true, y_proba, n_groups=n_groups,
+                     save_path=model_dir / "calibration.png")
+    plot_roc_with_ci(y_true, y_proba, n_bootstrap=n_bootstrap,
+                     save_path=model_dir / "roc.png")
+    boot = bootstrap_evaluation(y_true, y_proba, n_bootstrap=n_bootstrap,
+                                n_groups=n_groups, cut=cut)
+
+    print(f"\n{'='*50}")
+    print(f"  {name}")
+    print(f"{'='*50}")
+    print(f"  AUROC : {auroc:.4f}")
+    for k, v in cal.items():
+        print(f"  {k:<22}: {v:.4f}")
+    print("\n  Bootstrap 95% CI:")
+    print(boot.to_string())
+
+    result = {
+        "auroc": auroc,
+        "calibration": cal,
+        "bootstrap_ci": boot.to_dict(orient="index"),
+    }
+    with open(model_dir / "evaluation.json", "w") as f:
+        json.dump(result, f, indent=2)
+    return result
+
+
+def evaluate_all_models(
+    proba_dict: dict,
+    output_dir: Path,
+    n_bootstrap: int = 1000,
+    cut: float = 0.2,
+) -> pd.DataFrame:
+    """Run evaluate_model on every entry in proba_dict and print a summary table."""
+    summary_rows = []
+    for name, (y_series, p_series) in proba_dict.items():
+        common = y_series.index.intersection(p_series.index)
+        y = np.asarray(y_series.loc[common], dtype=float)
+        p = np.asarray(p_series.loc[common], dtype=float)
+        res = evaluate_model(name, y, p, output_dir,
+                             n_bootstrap=n_bootstrap, cut=cut)
+        cal = res["calibration"]
+        boot = res["bootstrap_ci"]
+        auc_lcl = boot["AUROC"]["LCL"]
+        auc_ucl = boot["AUROC"]["UCL"]
+        summary_rows.append({
+            "Model":        name,
+            "N":            len(y),
+            "AUROC":        round(res["auroc"], 3),
+            "AUROC 95% CI": f"[{auc_lcl:.3f}–{auc_ucl:.3f}]",
+            "O:E":          round(cal["O:E ratio"], 3),
+            "Slope":        round(cal["Cal. slope"], 3),
+            "ICI":          round(cal["ICI"], 4),
+        })
+
+    summary = pd.DataFrame(summary_rows)
+    print("\n\n=== CALIBRATION & DISCRIMINATION SUMMARY ===")
+    print(summary.to_string(index=False))
+    summary_path = output_dir / "calibration_summary.json"
+    summary.to_json(summary_path, orient="records", indent=2)
+    print(f"\n[OK] Summary saved to {summary_path}")
+    return summary
+
+
 # Main
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -603,3 +934,12 @@ if __name__ == "__main__":
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nResults saved to {results_path}")
+
+    # 8. Focused DCA for publication
+    print("\nFocused DCA (publication quality)...")
+    plot_dca_focused(
+        models=[
+            "with_contralateral", "parsimonious", "logistic_regression",
+            "peeters", "kinnaird", "erspc",
+        ],
+    )

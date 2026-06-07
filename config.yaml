@@ -5,54 +5,117 @@ common:
 
 paths:
   data_dir: data
-  source: data/dataframe_cleaned.csv
+  source: data/dataframe_cleaned_old.csv
   train: data/train_df.csv
   test: data/test_df.csv
   runs_dir: runs
-  model: runs\tuned_model\model.pkl
-  metadata: runs\tuned_model\metadata.json
+  model: runs/with_contralateral/model.pkl
+  metadata: runs/with_contralateral/metadata.json
 
 teams:
   hook_url: "https://ecambxl.webhook.office.com/webhookb2/13965ae2-f69f-4466-8b32-eb5b9c867eed@e3d6f09e-9ba9-4a36-ad75-d9039be4fe29/IncomingWebhook/a92dbd0799e84fc9b7c73edba03da28e/9fef2881-7fae-4931-8a8f-bf908ff35c9d/V2AvEeZIW5MzIrvSQ0vtoEbGPb5flJhBkPDfJvrGwEXYE1"
 
-model_v2:
-  run_test: false
+# Colonnes contralateral gérées via optuna.feature_set
+contralateral_features:
+  - contralateral_suspicious
+  - contralateral_pirads
+  - contralateral_diameter
+
+# Top-6 features
+parsimonious_features:
+  - psa_density
+  - pirads
+  - age
+  - prostate_volume
+  - diameter
+  - clinical_stage   
+
+model:
+  run_test: true
   auto_evaluate: false
   verbose: false
   features_to_drop:
     - Order
-
-  # features_to_drop:
-  # - Order
-  # - suspicious_trus
-  # - family_history
-  # - prev_neg_trus_biopsy
-  # - psa
-  # - nb_susp_lesions
-  # - diameter
-  # - contralateral_suspicious
-  # - contralateral_pirads
-  # - contralateral_diameter
-  # - epe
-  # - ant
-  # - mid
-  # - post
-  # - base
-  # - median
-  # - apical
-  
+    #- family_history              # 
+    #- diameter                    #
+    #- psa                         # colinéaire avec psa_density (r=0.94)
+    #- ant                         # colinéaire avec post (r=-0.66)
   early_stopping_metric: logloss
-  early_stopping_rounds: 100
-  common_threshold: 0.2
+  early_stopping_rounds: 0
+  common_threshold: 0.2 
+  xgb_params:
+    n_estimators: 276
+    max_depth: 2
+    learning_rate: 0.05346608671794814
+    subsample: 0.6616281870041653
+    colsample_bytree: 0.8523551125968567
+    min_child_weight: 1.9626831860345106
+    gamma: 0.6034837991136008
+    reg_lambda: 0.95718362815309
+    reg_alpha: 0.4075850318665423
 
 optuna:
-  n_trials: 2000
+  n_trials: 300
   n_folds: 5
   n_threads: -1
   tree_method: hist
   early_stopping_rounds: 50
-  study_name: prostate_xgb
+  seed: 2                          #
+  feature_set: with_contralateral   # with_contralateral | no_contralateral | parsimonious
   storage: sqlite:///optuna.db
+
+model_parsimonious:
+  xgb_params:
+    n_estimators: 320
+    max_depth: 2
+    learning_rate: 0.028868118241603975
+    subsample: 0.633536079602088
+    colsample_bytree: 0.6674215985000833
+    min_child_weight: 9.425740743093767
+    gamma: 0.19611291013240725
+    reg_lambda: 0.127257279289246
+    reg_alpha: 0.19757886816677825
+
+model_logreg:
+  run_test: true
+  verbose: true
+  critical_cols: [age, clinical_stage, pirads, prostate_volume, psa_density]
+  critical_nan_threshold_pct: 5.0
+  imputation_strategy: median
+  C: 1.0
+  penalty: l2
+  max_iter: 1000
+  common_threshold: 0.5
+  tune_C: false
+  C_grid: [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
+  n_folds: 5
+  apply_power_transform: false
+  continuous_cols: [age, prostate_volume, psa_density, pirads, nb_susp_lesions]
+
+compare:
+  run_metrics_table: true
+  run_delong: true
+  run_clinical_impact: true
+  run_dca: true
+  run_calibration: true
+  run_subgroup: true
+  run_error_analysis: true
+
+  dca_models:
+    - All features
+    - No contralateral
+    - Parsimonious
+    - LogReg
+    - Peeters
+    - Kinnaird
+    - ERSPC
+  paths:
+    xgb_all_features:         runs/with_contralateral/model.pkl
+    xgb_all_features_default: runs/all_features_default/model.pkl
+    xgb_no_contra:            runs/no_contralateral/model.pkl
+    xgb_no_contra_default:    runs/no_contralateral_default/model.pkl
+    xgb_parsimonious:         runs/parsimonious/model.pkl
+    logreg:                   runs/logreg/model.pkl
 
 evaluate:
   use_test_df: true
@@ -63,4 +126,3 @@ evaluate:
   subgroup_min_size: 30
 
 split:
-  test_size: 0.10

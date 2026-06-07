@@ -2,7 +2,7 @@
 *.png
 
 # Fichiers pickle
-*.pkl
+#*.pkl
 
 # Bases de données
 *.db
@@ -16,3 +16,7 @@
 # Dossiers
 __pycache__/
 runs/
+outputs/
+
+# Bases de données SQLite
+*.sqlite3

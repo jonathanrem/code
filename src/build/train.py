@@ -1,6 +1,17 @@
+"""
+Train script pour le modèle XGBoost csPCa.
+
+Les fichiers `data/train_df.csv` et `data/test_df.csv` lus ici
+proviennent d'un split par centre entier réalisé en amont via
+`src/build/split_by_center.ipynb`. Le test set est composé de
+centres absents du train, garantissant une validation externe
+géographique. Voir section 3.8 du rapport TFE pour la liste des
+centres affectés au test.
+"""
 import hashlib
 import json
 import pickle
+import argparse
 import shutil
 import subprocess
 import sys
@@ -13,7 +24,6 @@ import xgboost as xgb
 from sklearn.metrics import (
     average_precision_score,
     brier_score_loss,
-    classification_report,
     precision_recall_curve,
     roc_auc_score,
     roc_curve,
@@ -26,36 +36,35 @@ from common.config import load_config, cfg_get, cfg_path, CONFIG, BASE_DIR
 CONFIG_PATH = BASE_DIR / "config.yaml"
 CONFIG = load_config(CONFIG_PATH)
 
+_VALID_FEATURE_SETS = ("with_contralateral", "no_contralateral", "parsimonious")
+_parser = argparse.ArgumentParser(add_help=False)
+_parser.add_argument("--feature-set", choices=_VALID_FEATURE_SETS, default=None)
+_args, _ = _parser.parse_known_args()
+
 DATA_PATH_TRAIN = cfg_path(CONFIG, "paths.train", "data/train_df.csv")
 DATA_PATH_TEST = cfg_path(CONFIG, "paths.test", "data/test_df.csv")
 RUNS_DIR = cfg_path(CONFIG, "paths.runs_dir", "runs")
 TARGET_COL = cfg_get(CONFIG, "common.target_col", "outcome")
 RANDOM_STATE = cfg_get(CONFIG, "common.random_state", 2)
 N_THREADS = cfg_get(CONFIG, "common.n_threads", 32)
-RUN_TEST = cfg_get(CONFIG, "model_v2.run_test", False)
-features_to_drop = cfg_get(CONFIG, "model_v2.features_to_drop", ["Order"])
-early_stopping_metric = cfg_get(CONFIG, "model_v2.early_stopping_metric", "logloss")
-common_threshold = cfg_get(CONFIG, "model_v2.common_threshold", 0.5)
-EARLY_STOPPING_ROUNDS = cfg_get(CONFIG, "model_v2.early_stopping_rounds", 100)
-AUTO_EVALUATE = cfg_get(CONFIG, "model_v2.auto_evaluate", False)
-VERBOSE = cfg_get(CONFIG, "model_v2.verbose", True)
+RUN_TEST = cfg_get(CONFIG, "model.run_test", False)
+_base_features_to_drop = list(cfg_get(CONFIG, "model.features_to_drop", ["Order"]))
+early_stopping_metric = cfg_get(CONFIG, "model.early_stopping_metric", "logloss")
+common_threshold = cfg_get(CONFIG, "model.common_threshold", 0.5)
+EARLY_STOPPING_ROUNDS = cfg_get(CONFIG, "model.early_stopping_rounds", 100)
+AUTO_EVALUATE = cfg_get(CONFIG, "model.auto_evaluate", False)
+VERBOSE = cfg_get(CONFIG, "model.verbose", True)
 MODEL_COMPARISON_PATH = BASE_DIR / "model_comparison.xlsx"
-OPTUNA_LABEL = cfg_get(CONFIG, "model_v2.optuna_label", "none")
-FEATURES_LABEL = cfg_get(CONFIG, "model_v2.features_label", "")
-
-
-def infer_features_label(drop_list: list) -> str:
-    if isinstance(drop_list, list):
-        only_order = all(f == "Order" for f in drop_list) and len(drop_list) > 0
-        if only_order:
-            return "all"
-        if len(drop_list) > 0:
-            return "top5"
-    return "all"
-
-
-if not FEATURES_LABEL:
-    FEATURES_LABEL = infer_features_label(features_to_drop)
+OPTUNA_LABEL = cfg_get(CONFIG, "model.optuna_label", "none")
+CONTRALATERAL = cfg_get(CONFIG, "contralateral_features", [])
+PARSIMONIOUS = list(cfg_get(CONFIG, "parsimonious_features", []))
+FEATURE_SET = _args.feature_set or cfg_get(CONFIG, "optuna.feature_set", "with_contralateral")
+if FEATURE_SET not in _VALID_FEATURE_SETS:
+    raise ValueError(
+        f"feature_set invalide : '{FEATURE_SET}'. "
+        f"Valeurs acceptées : {', '.join(_VALID_FEATURE_SETS)}"
+    )
+FEATURES_LABEL = FEATURE_SET
 
 
 def log(message: str) -> None:
@@ -64,6 +73,12 @@ def log(message: str) -> None:
 
 
 def plot_roc_pr(y_true, y_proba, out_path, title_prefix):
+    """Plot ROC and PR curves side by side.
+
+    NOTE: The PR panel (AUPRC) is prevalence-dependent and classified as
+    improper by Van Calster et al. (2025). Retained for exploratory use;
+    not called in the default training pipeline.
+    """
     fpr, tpr, _ = roc_curve(y_true, y_proba)
     precision, recall, _ = precision_recall_curve(y_true, y_proba)
     auc_score = roc_auc_score(y_true, y_proba)
@@ -190,6 +205,8 @@ def save_run_artifacts(run_dir: Path, run_id: str, model, xgb_params: dict,
 
     metadata = {
         "model_type": "XGBClassifier",
+        "feature_set": FEATURE_SET,
+        "contralateral_used": FEATURE_SET == "with_contralateral" and any(c in X_train.columns for c in CONTRALATERAL),
         "features": list(X_train.columns),
         "n_features": X_train.shape[1],
         "target": TARGET_COL,
@@ -262,23 +279,32 @@ def update_model_comparison(auc_train: float, auc_val: float) -> None:
 run_dir, run_id = create_run_directory()
 log(f"run_id: {run_id}")
 
-# xgboost hyperparameters
-xgb_params = {
+_XGB_DEFAULTS = {
     "booster": "gbtree",
-    "n_estimators": 920,
-    "max_depth": 5,
-    "learning_rate": 0.011646280706654745,
-    "subsample": 0.6466293763183071,
-    "colsample_bytree": 0.6137276589083372,
-    "min_child_weight": 9.040553875036899,
-    "gamma": 0.4703008928805035,
-    "reg_lambda": 0.13679563134787812,
-    "reg_alpha": 0.7676956279375986,
-    "random_state": RANDOM_STATE,
-    "n_jobs": N_THREADS,
-    "enable_categorical": True,
-    "early_stopping_rounds": EARLY_STOPPING_ROUNDS,
+    "n_estimators": 100,
+    "max_depth": 6,
+    "learning_rate": 0.3,
+    "subsample": 1.0,
+    "colsample_bytree": 1.0,
+    "min_child_weight": 1.0,
+    "gamma": 0.0,
+    "reg_lambda": 1.0,
+    "reg_alpha": 0.0,
 }
+_xgb_config_section = "model_parsimonious" if FEATURE_SET == "parsimonious" else "model"
+_cfg_xgb = cfg_get(CONFIG, f"{_xgb_config_section}.xgb_params", {}) or {}
+xgb_params = {
+    **_XGB_DEFAULTS,
+    **_cfg_xgb,
+    "random_state": RANDOM_STATE,  # type: ignore
+    "n_jobs": N_THREADS,           # type: ignore
+    "enable_categorical": True,
+    "early_stopping_rounds": EARLY_STOPPING_ROUNDS,  # type: ignore
+}
+if _cfg_xgb:
+    log(f"xgb_params: loaded from config[{_xgb_config_section}] ({len(_cfg_xgb)} keys overridden)")
+else:
+    log("xgb_params: using XGBoost defaults")
 
 log("LOAD DATA")
 df_train = pd.read_csv(DATA_PATH_TRAIN, sep=";")
@@ -299,12 +325,32 @@ else:
     X_test = None
 
 log("DROP FEATURES")
-existing_to_drop = [f for f in features_to_drop if f in X_train.columns]
-if existing_to_drop:
-    X_train = X_train.drop(columns=existing_to_drop)
+if FEATURE_SET == "parsimonious":
+    if not PARSIMONIOUS:
+        raise ValueError("parsimonious_features vide dans config.yaml")
+    missing = [c for c in PARSIMONIOUS if c not in X_train.columns]
+    if missing:
+        raise ValueError(f"parsimonious_features absentes du CSV train : {missing}")
+    X_train = X_train[PARSIMONIOUS]
     if RUN_TEST:
-        X_test = X_test.drop(columns=existing_to_drop)
-    log(f"dropped: {existing_to_drop}")
+        X_test = X_test[PARSIMONIOUS]
+    log(f"parsimonious features ({len(PARSIMONIOUS)}): {PARSIMONIOUS}")
+elif FEATURE_SET == "no_contralateral":
+    features_to_drop = list(set(_base_features_to_drop) | set(CONTRALATERAL))
+    existing_to_drop = [f for f in features_to_drop if f in X_train.columns]
+    if existing_to_drop:
+        X_train = X_train.drop(columns=existing_to_drop)
+        if RUN_TEST:
+            X_test = X_test.drop(columns=existing_to_drop)
+        log(f"dropped: {existing_to_drop}")
+else:  # with_contralateral
+    features_to_drop = [f for f in _base_features_to_drop if f not in CONTRALATERAL]
+    existing_to_drop = [f for f in features_to_drop if f in X_train.columns]
+    if existing_to_drop:
+        X_train = X_train.drop(columns=existing_to_drop)
+        if RUN_TEST:
+            X_test = X_test.drop(columns=existing_to_drop)
+        log(f"dropped: {existing_to_drop}")
 
 log("CATEGORICAL HANDLING")
 object_cols = X_train.select_dtypes(include=["object"]).columns.tolist()
@@ -342,7 +388,10 @@ model.fit(
     verbose=50,
 )
 
-best_iteration = model.best_iteration or model.n_estimators
+try:
+    best_iteration = model.best_iteration or model.n_estimators
+except AttributeError:
+    best_iteration = model.n_estimators
 log(f"\nbest iteration: {best_iteration}")
 
 log("EVALUATE ON TRAIN/VAL/TEST")
@@ -369,12 +418,6 @@ else:
     log(f"brier  - train: {brier_tr:.4f} | val: {brier_val:.4f}")
 
 threshold_final = common_threshold
-log(f"CLASSIFICATION REPORT (threshold={threshold_final:.3f})")
-if RUN_TEST:
-    y_test_pred = (y_test_pred_proba >= threshold_final).astype(int)
-    log("\n" + classification_report(y_test, y_test_pred))
-else:
-    log("test evaluation skipped")
 
 log("SAVING RUN ARTIFACTS")
 save_run_artifacts(
@@ -397,6 +440,15 @@ save_run_artifacts(
     y_train=y_train,
     y_test=y_test,
 )
+
+log("SAVING CANONICAL COPY")
+_canonical_dir = RUNS_DIR / FEATURE_SET
+_canonical_dir.mkdir(parents=True, exist_ok=True)
+for _fname in ("model.pkl", "metadata.json", "params.json", "config.yaml"):
+    _src = run_dir / _fname
+    if _src.exists():
+        shutil.copy(_src, _canonical_dir / _fname)
+log(f"canonical: {_canonical_dir}")
 
 log("FINAL MODEL TRAINING COMPLETE")
 log(f"\nrun directory: {run_dir}")

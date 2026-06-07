@@ -1,3 +1,4 @@
+import pickle
 import sys
 from pathlib import Path
 
@@ -9,8 +10,10 @@ from pandas import DataFrame, Series
 from scipy.special import expit as sigmoid
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
+from common.config import load_config, cfg_get, cfg_path
 
 _ROOT = Path(__file__).resolve().parent.parent.parent
+_CONFIG = load_config(_ROOT / "config.yaml")
 
 def get_probabilities_peter2022(df: DataFrame) -> tuple[Series, Series]:
     # Drop rows where necessary variables are missing
@@ -70,26 +73,39 @@ def get_probabilities_xgb(
             df[col] = df[col].astype("category")
     X = df.drop(columns=["outcome"]).copy()
     y = df["outcome"].copy()
-    print("Model expects:", model.feature_names_in_)
-    print("Data columns:", X.columns.tolist())
+    expected = list(model.feature_names_in_)
+    X = X[expected]
     proba = pd.Series(model.predict_proba(X)[:, 1], index=df.index)
     return y, proba
 
 
 def get_probabilities_xgbtuned(df: DataFrame) -> tuple[Series, Series]:
-    model = joblib.load(_ROOT / "models" / "baselines" / "tuned_model.pkl")
+    model = joblib.load(_ROOT / "runs" / "xgb_300_trials_old_dataset" / "model.pkl")
     return get_probabilities_xgb(df=df, model=model)
 
 
 def get_probabilities_xgbdefault(df: DataFrame) -> tuple[Series, Series]:
-    model = joblib.load(_ROOT / "models" / "baselines" / "default_model.pkl")
+    model = joblib.load(_ROOT / "runs" / "xgb_default_old_dataset" / "model.pkl")
+    return get_probabilities_xgb(df=df, model=model)
+
+
+def get_probabilities_xgbtunedfe(df: DataFrame) -> tuple[Series, Series]:
+    model = joblib.load(_ROOT / "models" / "baselines" / "tuned_fe_model.pkl")
+    return get_probabilities_xgb(df=df, model=model)
+
+
+def get_probabilities_xgbtunedfe_logloss(df: DataFrame) -> tuple[Series, Series]:
+    model = joblib.load(_ROOT / "runs" / "xgb_1000trials_fe_logloss" / "model.pkl")
     return get_probabilities_xgb(df=df, model=model)
 
 
 def get_probabilities_logistic_regression(df: DataFrame) -> tuple[Series, Series]:
     X = df.drop(columns=["outcome"]).copy()
     y = df["outcome"].copy()
-    pipeline = joblib.load(_ROOT / "models" / "baselines" / "logistic_regression.pkl")
+    pipeline = joblib.load(_ROOT / "models" / "baselines" / "logistic_regression_old.pkl")
+    lr = pipeline.steps[-1][1]
+    if not hasattr(lr, "multi_class"):
+        lr.multi_class = "auto"
     return y, pd.Series(pipeline.predict_proba(X)[:, 1], index=X.index)
 
 
@@ -102,6 +118,52 @@ def get_probabilities_erspc(df: DataFrame) -> tuple[Series, Series]:
     y = merged_df["outcome"].copy()
     proba = pd.Series(merged_df["Probability csPCa"].values, index=merged_df.index)
     return y, proba
+
+
+def get_probabilities_xgb_all_features(df: DataFrame) -> tuple[Series, Series]:
+    model_path = cfg_path(_CONFIG, "compare.paths.xgb_all_features", "runs/all_features_tuned/model.pkl")
+    model = joblib.load(model_path)
+    return get_probabilities_xgb(df=df.copy(), model=model)
+
+
+def get_probabilities_xgb_no_contra(df: DataFrame) -> tuple[Series, Series]:
+    model_path = cfg_path(_CONFIG, "compare.paths.xgb_no_contra", "runs/no_contralateral_tuned/model.pkl")
+    model = joblib.load(model_path)
+    return get_probabilities_xgb(df=df.copy(), model=model)
+
+
+def get_probabilities_xgb_all_features_default(df: DataFrame) -> tuple[Series, Series]:
+    model_path = cfg_path(_CONFIG, "compare.paths.xgb_all_features_default", "runs/all_features_default/model.pkl")
+    model = joblib.load(model_path)
+    return get_probabilities_xgb(df=df.copy(), model=model)
+
+
+def get_probabilities_xgb_no_contra_default(df: DataFrame) -> tuple[Series, Series]:
+    model_path = cfg_path(_CONFIG, "compare.paths.xgb_no_contra_default", "runs/no_contralateral_default/model.pkl")
+    model = joblib.load(model_path)
+    return get_probabilities_xgb(df=df.copy(), model=model)
+
+
+def get_probabilities_xgb_parsimonious(df: DataFrame) -> tuple[Series, Series]:
+    model_path = cfg_path(_CONFIG, "compare.paths.xgb_parsimonious", "runs/parsimonious/model.pkl")
+    model = joblib.load(model_path)
+    return get_probabilities_xgb(df=df.copy(), model=model)
+
+
+def get_probabilities_logreg_new(df: DataFrame) -> tuple[Series, Series]:
+    model_path = cfg_path(_CONFIG, "compare.paths.logreg", "runs/logreg/model.pkl")
+    with open(model_path, "rb") as f:
+        pipeline = pickle.load(f)
+    lr = pipeline.steps[-1][1]
+    if not hasattr(lr, "multi_class"):
+        lr.multi_class = "auto"
+    features_to_drop = cfg_get(_CONFIG, "model.features_to_drop", ["Order"])
+    df = df.copy()
+    df["age"]         = pd.to_numeric(df.get("age",         pd.Series(dtype=float)), errors="coerce")
+    df["psa_density"] = pd.to_numeric(df.get("psa_density", pd.Series(dtype=float)), errors="coerce")
+    y = df["outcome"].copy()
+    X = df.drop(columns=[c for c in features_to_drop + ["outcome"] if c in df.columns])
+    return y, pd.Series(pipeline.predict_proba(X)[:, 1], index=X.index)
 
 
 def get_probabilities_kinnaird(df: DataFrame) -> tuple[Series, Series]:

@@ -3,6 +3,7 @@ XGBoost hyperparameter optimization using Optuna with Microsoft Teams notificati
 Run this before train.py to find optimal hyperparameters.
 Results are stored in optuna.db (SQLite) and can be resumed.
 """
+import argparse
 import sys
 from pathlib import Path
 
@@ -14,6 +15,11 @@ import xgboost as xgb
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from common.config import cfg_get, cfg_path, CONFIG
 
+_VALID_FEATURE_SETS = ("with_contralateral", "no_contralateral", "parsimonious")
+_parser = argparse.ArgumentParser(add_help=False)
+_parser.add_argument("--feature-set", choices=_VALID_FEATURE_SETS, default=None)
+_args, _ = _parser.parse_known_args()
+
 DATA_PATH_TRAIN = cfg_path(CONFIG, "paths.train", "data/train_df.csv")
 TARGET_COL = cfg_get(CONFIG, "common.target_col", "outcome")
 RANDOM_STATE = cfg_get(CONFIG, "common.random_state", 2)
@@ -23,11 +29,18 @@ N_THREADS = cfg_get(CONFIG, "optuna.n_threads", cfg_get(CONFIG, "common.n_thread
 TREE_METHOD = cfg_get(CONFIG, "optuna.tree_method", "hist")
 EARLY_STOPPING_ROUNDS = cfg_get(CONFIG, "optuna.early_stopping_rounds", 50)
 OPTUNA_STORAGE = cfg_get(CONFIG, "optuna.storage", "sqlite:///optuna.db")
+TPE_SEED = cfg_get(CONFIG, "optuna.seed", 2)
 MSTEAMS_HOOK_URL = cfg_get(CONFIG, "teams.hook_url", "")
 
-# Feature set: "all" or "top5"
-FEATURE_SET = "all"
-OPTUNA_STUDY_NAME = f"{cfg_get(CONFIG, 'optuna.study_name', 'xgb_optuna')}_{FEATURE_SET}"
+CONTRALATERAL = cfg_get(CONFIG, "contralateral_features", [])
+PARSIMONIOUS = list(cfg_get(CONFIG, "parsimonious_features", []))
+FEATURE_SET = _args.feature_set or cfg_get(CONFIG, "optuna.feature_set", "with_contralateral")
+if FEATURE_SET not in _VALID_FEATURE_SETS:
+    raise ValueError(
+        f"feature_set invalide : '{FEATURE_SET}'. "
+        f"Valeurs acceptées : {', '.join(_VALID_FEATURE_SETS)}"
+    )
+OPTUNA_STUDY_NAME = f"prostate_xgb_{FEATURE_SET}"
 
 myTeamsMessage = (
     pymsteams.connectorcard(MSTEAMS_HOOK_URL, verify=False)
@@ -36,15 +49,28 @@ myTeamsMessage = (
 )
 
 df = pd.read_csv(DATA_PATH_TRAIN, sep=";")
-if "Order" in df.columns:
-    df = df.drop(columns=["Order"])
+_base_drop = list(cfg_get(CONFIG, "model.features_to_drop", ["Order"]))
 
-if FEATURE_SET == "top5":
-    features_to_drop = cfg_get(CONFIG, "model_v2.features_to_drop", ["Order"])
+if FEATURE_SET == "parsimonious":
+    if not PARSIMONIOUS:
+        raise ValueError("parsimonious_features vide dans config.yaml")
+    missing = [c for c in PARSIMONIOUS if c not in df.columns]
+    if missing:
+        raise ValueError(f"parsimonious_features absentes du CSV : {missing}")
+    df = df[[TARGET_COL] + PARSIMONIOUS]
+    print(f"parsimonious features: {PARSIMONIOUS}")
+elif FEATURE_SET == "no_contralateral":
+    features_to_drop = list(set(_base_drop) | set(CONTRALATERAL))
     existing_to_drop = [f for f in features_to_drop if f in df.columns]
     if existing_to_drop:
         df = df.drop(columns=existing_to_drop)
-        print(f"top5 mode: dropped {len(existing_to_drop)} features")
+        print(f"dropped features: {existing_to_drop}")
+else:  # with_contralateral
+    features_to_drop = [f for f in _base_drop if f not in CONTRALATERAL]
+    existing_to_drop = [f for f in features_to_drop if f in df.columns]
+    if existing_to_drop:
+        df = df.drop(columns=existing_to_drop)
+        print(f"dropped features: {existing_to_drop}")
 
 y = df[TARGET_COL]
 X = df.drop(columns=[TARGET_COL])
@@ -71,7 +97,7 @@ def objective(trial):
         "objective": "binary:logistic",
         "eval_metric": "auc",
         "tree_method": TREE_METHOD,
-        "booster": trial.suggest_categorical("booster", ["gbtree", "dart"]),
+        "booster": "gbtree",
         "max_depth": trial.suggest_int("max_depth", 2, 8),
         "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.2, log=True),
         "subsample": trial.suggest_float("subsample", 0.6, 1.0),
@@ -107,15 +133,24 @@ def objective(trial):
 
 
 if __name__ == "__main__":
+    sampler = optuna.samplers.TPESampler(seed=TPE_SEED)
     study = optuna.create_study(
         study_name=OPTUNA_STUDY_NAME,
         storage=OPTUNA_STORAGE,
         load_if_exists=True,
         direction="maximize",
+        sampler=sampler,
     )
+    study.set_user_attr("feature_set", FEATURE_SET)
+    study.set_user_attr("features", list(X.columns))
+    study.set_user_attr("n_features", X.shape[1])
+    study.set_user_attr("contralateral_used", FEATURE_SET == "with_contralateral" and any(c in X.columns for c in CONTRALATERAL))
 
     n_completed = len(study.trials)
     n_remaining = max(0, N_TRIALS - n_completed)
+    print(f"study: {OPTUNA_STUDY_NAME}")
+    print(f"feature_set: {FEATURE_SET} ({X.shape[1]} features)")
+    print(f"contralateral_used: {study.user_attrs['contralateral_used']}")
     print(f"trials completed: {n_completed}/{N_TRIALS}")
 
     if n_remaining > 0:

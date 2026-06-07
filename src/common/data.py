@@ -110,3 +110,20 @@ def get_feature_label(metadata: Dict) -> str:
     if isinstance(features, list) and features:
         return "top5" if len(features) <= 5 else "all"
     return "unknown"
+
+
+def assert_center_disjoint(df_train: pd.DataFrame, df_test: pd.DataFrame) -> None:
+    """Assert no center appears in both train and test sets.
+
+    Guarantees the geographic external validation claim: test patients
+    come from centers entirely unseen during training (split_by_center.ipynb).
+    Silently skips if no center column is present in both dataframes.
+    """
+    center_col = next(
+        (c for c in ["center", "Center"] if c in df_train.columns and c in df_test.columns),
+        None,
+    )
+    if center_col is None:
+        return
+    common = set(df_train[center_col].dropna()) & set(df_test[center_col].dropna())
+    assert not common, f"Centres communs entre train et test : {common}"
